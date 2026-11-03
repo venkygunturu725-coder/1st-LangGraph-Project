@@ -1,0 +1,23 @@
+models:
+  - type: main
+    engine: ollama
+    model: llama3.2:3b
+    parameters:
+      temperature: 0.0
+      num_ctx: 4096
+
+# Design rationale: this is the FULL list of input flows, in execution order. agent.py
+# builds one LLMRails per selection by keeping only the flows the user switched on
+# (see guardrails_registry.flows_for), so this file documents what exists and the
+# registry decides what runs. Order matters: the first flow that calls `stop` ends the
+# pipeline, and `check sre scope` needs the $tools that `route request` sets.
+rails:
+  input:
+    flows:
+      - check prompt injection   # regex only, no LLM call
+      - route request            # regex only, no LLM call
+      - check sre scope          # skipped when a task was detected; else one tiny LLM call
+
+# Removed on purpose: the `self check input` flow and its prompt. agent.py replaces the
+# flow list per request, so that rail never ran. To bring it back, add it to the
+# registry (one entry) and re-add the prompt here.

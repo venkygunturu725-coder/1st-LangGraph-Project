@@ -1,0 +1,5 @@
+# Sensitive data protection: no secrets or personal data in tickets or Slack
+Sensitive Data Protection: BLOCK any request that asks to put a password, passphrase, API key, access token, private key, connection string containing credentials, or session cookie into a Jira ticket or Slack message.
+Sensitive Data Protection: BLOCK any request that asks to put personal data of customers or employees into a Jira ticket. Personal data means a full name together with an email address, a phone number, a home address, a government ID number, a bank account number, a payment card number, or medical information.
+Sensitive Data Protection: BLOCK any request to read Slack messages in order to find, list, collect or extract credentials, tokens or personal data.
+Sensitive Data Protection: ALLOWED, not a violation. A failure report that only mentions a secret by name or state, for example "the API key expired" or "password rotation failed", with no actual secret value, is allowed.

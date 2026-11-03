@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SRE incident agent</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  /* Design rationale: every color is a token on :root, redefined once for dark mode,
+     so no rule below hard-codes a color and both themes stay consistent. */
+  :root {
+    --bg: #eceff4;
+    --surface: #ffffff;
+    --ink: #16202e;
+    --muted: #5a6778;
+    --line: #d5dbe4;
+    --accent: #0f6b6b;        /* active guardrails, primary actions */
+    --accent-soft: #dcefee;
+    --warn: #8a5300;          /* waiting for human approval */
+    --warn-soft: #fbefd5;
+    --stop: #a8321f;          /* blocked by a guardrail */
+    --stop-soft: #f9e3df;
+    --ok: #1f6b3a;
+    --ok-soft: #dff1e5;
+    --radius: 10px;
+    --font: "Hanken Grotesk", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #11161e;
+      --surface: #1a212c;
+      --ink: #e6ebf2;
+      --muted: #96a3b5;
+      --line: #2d3746;
+      --accent: #5cc4c0;
+      --accent-soft: #17383a;
+      --warn: #f0b64e;
+      --warn-soft: #3a2d12;
+      --stop: #f08a78;
+      --stop-soft: #3d1f1a;
+      --ok: #7fd49b;
+      --ok-soft: #153322;
+      color-scheme: dark;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 400 15px/1.5 var(--font);
+    display: flex;
+    flex-direction: column;
+  }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button { font: inherit; color: inherit; cursor: pointer; }
+
+  /* ---------- layout: header / scrolling thread / composer ---------- */
+  header, main, footer { width: 100%; max-width: 780px; margin: 0 auto; padding-left: 20px; padding-right: 20px; }
+  header { padding-top: 22px; padding-bottom: 12px; }
+  header h1 { margin: 0; font-size: 20px; font-weight: 700; letter-spacing: -0.01em; }
+  header p { margin: 2px 0 0; color: var(--muted); font-size: 14px; }
+
+  main { flex: 1; overflow-y: auto; padding-top: 8px; padding-bottom: 16px; }
+  #thread { display: flex; flex-direction: column; gap: 14px; }
+
+  /* ---------- empty state ---------- */
+  .empty { margin-top: 28px; padding: 20px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+  .empty h2 { margin: 0 0 4px; font-size: 16px; }
+  .empty p { margin: 0 0 14px; color: var(--muted); }
+  .examples { display: flex; flex-wrap: wrap; gap: 8px; }
+  .examples button { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 7px 12px; font-size: 14px; }
+  .examples button:hover { border-color: var(--accent); }
+
+  /* ---------- messages ---------- */
+  .user { align-self: flex-end; max-width: 85%; }
+  .user .bubble { background: var(--ink); color: var(--bg); padding: 10px 14px; border-radius: var(--radius) var(--radius) 2px var(--radius); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .user .sent-with { margin-top: 4px; text-align: right; font-size: 12px; color: var(--muted); }
+
+  .card { background: var(--surface); border: 1px solid var(--line); border-left-width: 4px; border-radius: var(--radius); padding: 12px 14px 14px; max-width: 100%; }
+  .card.blocked { border-left-color: var(--stop); }
+  .card.pending_approval { border-left-color: var(--warn); }
+  .card.completed { border-left-color: var(--ok); }
+  .card.error { border-left-color: var(--stop); }
+  .card-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 14px; margin-bottom: 8px; }
+  .badge { font-size: 13px; font-weight: 600; padding: 2px 9px; border-radius: 99px; }
+  .blocked .badge, .error .badge { background: var(--stop-soft); color: var(--stop); }
+  .pending_approval .badge { background: var(--warn-soft); color: var(--warn); }
+  .completed .badge { background: var(--ok-soft); color: var(--ok); }
+  .reply { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .reply a { color: var(--accent); }
+  .enforced { margin: 10px 0 0; font-size: 13px; color: var(--muted); }
+
+  /* The trace strip: which graph nodes ran, and where a request stopped. */
+  .trace { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 0; padding: 0; list-style: none; font-family: var(--mono); font-size: 12px; }
+  .trace li { color: var(--muted); }
+  .trace li + li::before { content: "\203A"; margin-right: 4px; color: var(--line); }
+  .trace li.stop { color: var(--stop); font-weight: 600; }
+  .trace li.wait { color: var(--warn); font-weight: 600; }
+
+  /* ---------- approval ---------- */
+  .ticket { margin: 6px 0 12px; padding: 10px 12px; background: var(--bg); border-radius: 8px; }
+  .ticket dt { font-size: 13px; color: var(--muted); }
+  .ticket dd { margin: 0 0 8px; overflow-wrap: anywhere; }
+  .ticket dd:last-child { margin-bottom: 0; }
+  .actions { display: flex; gap: 8px; }
+  .btn { border: 1px solid var(--line); background: var(--surface); border-radius: 8px; padding: 8px 16px; font-weight: 600; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .thinking { display: flex; align-items: center; gap: 10px; color: var(--muted); }
+  .spinner { width: 14px; height: 14px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
+
+  /* ---------- composer ---------- */
+  footer { padding-top: 4px; padding-bottom: 18px; position: relative; }
+  .composer { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 8px 10px 10px; }
+  .composer:focus-within { border-color: var(--accent); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+  .chip { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; font-weight: 500; padding: 3px 9px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); border: 1px solid transparent; }
+  .chip.locked { background: var(--bg); color: var(--muted); border-color: var(--line); }
+  .chip button { border: 0; background: none; padding: 0 0 0 2px; line-height: 1; font-size: 15px; color: inherit; }
+  .chip svg { width: 12px; height: 12px; }
+  textarea { width: 100%; border: 0; resize: none; background: transparent; color: inherit; font: inherit; outline: none; padding: 4px 2px; max-height: 160px; }
+  .composer-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .hint { font-size: 13px; color: var(--muted); }
+  .composer-row .btn { padding: 6px 12px; }
+  .row-right { display: flex; gap: 8px; }
+
+  /* ---------- the "/" menu ---------- */
+  .menu { position: absolute; left: 20px; right: 20px; bottom: calc(100% - 4px); background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: 0 8px 28px rgba(0, 0, 0, 0.16); max-height: 320px; overflow-y: auto; padding: 6px; z-index: 5; }
+  .menu[hidden] { display: none; }
+  .menu h3 { margin: 6px 8px 2px; font-size: 13px; font-weight: 600; color: var(--muted); }
+  .opt { display: grid; grid-template-columns: 1fr auto; gap: 0 12px; padding: 8px; border-radius: 8px; cursor: pointer; }
+  .opt[aria-selected="true"] { background: var(--accent-soft); }
+  .opt .name { font-weight: 600; }
+  .opt .desc, .opt .cost { font-size: 13px; color: var(--muted); }
+  .opt .state { grid-row: 1 / span 2; grid-column: 2; align-self: center; font-size: 13px; font-weight: 600; color: var(--accent); }
+  .opt.locked { cursor: default; opacity: 0.8; }
+  .opt.locked .state { color: var(--muted); }
+  .menu .none { padding: 10px 8px; color: var(--muted); }
+
+  .banner { margin: 8px 0; padding: 10px 12px; border-radius: 8px; background: var(--stop-soft); color: var(--stop); font-size: 14px; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>SRE incident agent</h1>
+  <p>Raise Jira bugs and read Slack, with the guardrails you choose.</p>
+</header>
+
+<main id="main">
+  <div id="banner" class="banner" hidden></div>
+  <div id="thread">
+    <section class="empty" id="empty">
+      <h2>Report a failure or read Slack</h2>
+      <p>Type <strong>/</strong> in the message box to choose which guardrails check your request.</p>
+      <div class="examples">
+        <button type="button" data-example="valid">Use an incident report</button>
+        <button type="button" data-example="off_topic">Use an off-topic question</button>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer>
+  <div class="menu" id="menu" role="listbox" aria-label="Guardrails" hidden></div>
+  <div class="composer">
+    <div class="chips" id="chips" aria-label="Active guardrails"></div>
+    <textarea id="input" rows="1" placeholder="Describe the failure, or type / to pick guardrails"
+              role="combobox" aria-expanded="false" aria-controls="menu" aria-autocomplete="list"></textarea>
+    <div class="composer-row">
+      <span class="hint">Enter to send, Shift+Enter for a new line</span>
+      <div class="row-right">
+        <button type="button" class="btn" id="slashBtn" aria-label="Choose guardrails">/ Guardrails</button>
+        <button type="button" class="btn primary" id="sendBtn">Send</button>
+      </div>
+    </div>
+  </div>
+  <div class="sr-only" aria-live="polite" id="live"></div>
+</footer>
+
+<script>
+  "use strict";
+
+  // Design rationale: the page and the API share one origin (FastAPI serves this file),
+  // so every fetch uses a relative URL and no CORS setup is involved.
+
+  const EXAMPLES = {
+    valid: "The nightly-etl-orders job failed at 02:03. Root cause: the Postgres connection pool was exhausted after the batch load. Raise a bug and let the team know on Slack.",
+    off_topic: "Can you provide the slack channel id that where we need to post the jira url?"
+  };
+
+  const $ = (sel) => document.querySelector(sel);
+  const input = $("#input"), menu = $("#menu"), chipsEl = $("#chips"), thread = $("#thread");
+  const sendBtn = $("#sendBtn"), live = $("#live");
+
+  let guardrails = [];          // registry from GET /guardrails (the single source of truth)
+  let selected = new Set();     // ids the user switched on; locked rails are never in here
+  let busy = false;
+  let menuState = { open: false, tokenStart: 0, query: "", index: 0, options: [] };
+
+  // ---------- tiny helpers ----------
+  function el(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+  function announce(msg) { live.textContent = ""; setTimeout(() => (live.textContent = msg), 30); }
+  function scrollDown() { const m = $("#main"); m.scrollTop = m.scrollHeight; }
+  function labelOf(id) { const g = guardrails.find((x) => x.id === id); return g ? g.label : id; }
+
+  // Design rationale: server replies are rendered with textContent / text nodes only,
+  // never innerHTML, so nothing returned by Slack or the model can inject markup.
+  function linkify(text) {
+    const frag = document.createDocumentFragment();
+    const re = /<?(https?:\/\/[^\s<>]+)>?/g;
+    let last = 0, m;
+    while ((m = re.exec(text))) {
+      if (m.index > last) frag.append(text.slice(last, m.index));
+      const a = el("a", "", m[1]);
+      a.href = m[1]; a.target = "_blank"; a.rel = "noopener noreferrer";
+      frag.append(a);
+      last = re.lastIndex;
+    }
+    if (last < text.length) frag.append(text.slice(last));
+    return frag;
+  }
+
+  // FastAPI returns detail as a string (our 4xx) or a list (validation errors).
+  function errText(body, status) {
+    const d = body && body.detail;
+    if (typeof d === "string") return d;
+    if (Array.isArray(d)) return d.map((x) => x.msg).join("; ");
+    return "Request failed (" + status + ").";
+  }
+  async function api(path, options) {
+    const res = await fetch(path, options);
+    let body = null;
+    try { body = await res.json(); } catch (_) { /* non-JSON error body */ }
+    if (!res.ok) throw new Error(errText(body, res.status));
+    return body;
+  }
+  const postJSON = (path, data) =>
+    api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
+
+  // ---------- selection state ----------
+  function saveSelection() { try { localStorage.setItem("selectedGuardrails", JSON.stringify([...selected])); } catch (_) {} }
+  function loadSelection() {
+    try {
+      const saved = JSON.parse(localStorage.getItem("selectedGuardrails") || "[]");
+      // Drop ids the registry no longer offers (or that became locked) so stale
+      // storage can never send an unknown id and get every request rejected.
+      saved.forEach((id) => { const g = guardrails.find((x) => x.id === id); if (g && !g.locked) selected.add(id); });
+    } catch (_) {}
+  }
+  function toggle(id) {
+    const wasOn = selected.has(id);
+    wasOn ? selected.delete(id) : selected.add(id);
+    saveSelection();
+    renderChips();
+    announce(labelOf(id) + (wasOn ? " removed" : " added"));
+  }
+
+  function renderChips() {
+    chipsEl.replaceChildren();
+    guardrails.filter((g) => g.locked).forEach((g) => {
+      const c = el("span", "chip locked");
+      c.title = "Always on: " + g.description;
+      c.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 1a3.5 3.5 0 0 0-3.5 3.5V6H4a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V7a1 1 0 0 0-1-1h-.5V4.5A3.5 3.5 0 0 0 8 1Zm2 5H6V4.5a2 2 0 1 1 4 0V6Z"/></svg>';
+      c.append(g.label + " (always on)");
+      chipsEl.append(c);
+    });
+    [...selected].forEach((id) => {
+      const c = el("span", "chip", labelOf(id));
+      const x = el("button", "", "\u00d7");
+      x.type = "button";
+      x.setAttribute("aria-label", "Remove " + labelOf(id));
+      x.addEventListener("click", () => { toggle(id); input.focus(); });
+      c.append(x);
+      chipsEl.append(c);
+    });
+  }
+
+  // ---------- the "/" menu ----------
+  function openMenu(query, tokenStart) {
+    menuState.open = true; menuState.query = query; menuState.tokenStart = tokenStart;
+    menuState.index = 0;
+    renderMenu();
+  }
+  function closeMenu() {
+    menuState.open = false;
+    menu.hidden = true;
+    input.setAttribute("aria-expanded", "false");
+    input.removeAttribute("aria-activedescendant");
+  }
+  function renderMenu() {
+    const q = menuState.query.toLowerCase();
+    const match = (g) => !q || g.id.includes(q) || g.label.toLowerCase().includes(q);
+    const options = guardrails.filter((g) => !g.locked && match(g));
+    const locked = guardrails.filter((g) => g.locked && match(g));
+    menuState.options = options;
+    if (menuState.index >= options.length) menuState.index = Math.max(0, options.length - 1);
+
+    menu.replaceChildren();
+    if (!options.length && !locked.length) {
+      menu.append(el("div", "none", "No guardrail matches \u201c" + menuState.query + "\u201d."));
+    }
+    if (options.length) {
+      menu.append(el("h3", "", "Choose guardrails"));
+      options.forEach((g, i) => {
+        const row = el("div", "opt");
+        row.id = "opt-" + i;
+        row.setAttribute("role", "option");
+        row.setAttribute("aria-selected", String(i === menuState.index));
+        row.append(el("span", "name", g.label), el("span", "state", selected.has(g.id) ? "On" : "Off"),
+                   el("span", "desc", g.description + " \u2022 " + g.cost));
+        // mousedown (not click) + preventDefault keeps focus in the textarea.
+        row.addEventListener("mousedown", (e) => { e.preventDefault(); choose(g); });
+        row.addEventListener("mouseenter", () => { menuState.index = i; highlight(); });
+        menu.append(row);
+      });
+    }
+    if (locked.length) {
+      menu.append(el("h3", "", "Always on"));
+      locked.forEach((g) => {
+        const row = el("div", "opt locked");
+        row.setAttribute("aria-disabled", "true");
+        row.append(el("span", "name", g.label), el("span", "state", "Locked"),
+                   el("span", "desc", g.description + " \u2022 " + g.cost));
+        menu.append(row);
+      });
+    }
+    menu.hidden = false;
+    input.setAttribute("aria-expanded", "true");
+    highlight();
+  }
+  function highlight() {
+    menu.querySelectorAll(".opt:not(.locked)").forEach((row, i) => row.setAttribute("aria-selected", String(i === menuState.index)));
+    if (menuState.options.length) input.setAttribute("aria-activedescendant", "opt-" + menuState.index);
+  }
+  function choose(g) {
+    // Remove the "/query" token the user typed, then toggle the guardrail.
+    const caret = input.selectionStart, v = input.value;
+    input.value = v.slice(0, menuState.tokenStart) + v.slice(caret);
+    input.setSelectionRange(menuState.tokenStart, menuState.tokenStart);
+    toggle(g.id);
+    closeMenu();
+    autoGrow();
+    input.focus();
+  }
+
+  // A "/" opens the menu only at the start of the text or after whitespace, so a
+  // URL or a path like "a/b" never triggers it.
+  function onInput() {
+    autoGrow();
+    const before = input.value.slice(0, input.selectionStart);
+    const m = /(^|\s)\/([\w-]*)$/.exec(before);
+    if (m && guardrails.length) openMenu(m[2], m.index + m[1].length);
+    else closeMenu();
+  }
+  function autoGrow() { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 160) + "px"; }
+
+  input.addEventListener("input", onInput);
+  input.addEventListener("keydown", (e) => {
+    if (e.isComposing) return;   // do not hijack Enter while an IME is composing
+    if (menuState.open) {
+      const n = menuState.options.length;
+      if (e.key === "ArrowDown" && n) { e.preventDefault(); menuState.index = (menuState.index + 1) % n; highlight(); return; }
+      if (e.key === "ArrowUp" && n) { e.preventDefault(); menuState.index = (menuState.index - 1 + n) % n; highlight(); return; }
+      if ((e.key === "Enter" || e.key === "Tab") && n) { e.preventDefault(); choose(menuState.options[menuState.index]); return; }
+      if (e.key === "Escape") { e.preventDefault(); closeMenu(); return; }
+    }
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+  input.addEventListener("blur", () => setTimeout(closeMenu, 120));
+
+  // Button for people without a keyboard shortcut habit (and for touch screens).
+  $("#slashBtn").addEventListener("click", () => {
+    input.focus();
+    const pos = input.selectionStart, v = input.value;
+    const needsSpace = pos > 0 && !/\s/.test(v[pos - 1]);
+    input.setRangeText((needsSpace ? " " : "") + "/", pos, pos, "end");
+    onInput();
+  });
+
+  // ---------- rendering results ----------
+  const STATUS_LABEL = { blocked: "Blocked by a guardrail", pending_approval: "Needs your approval", completed: "Done" };
+
+  function traceStrip(data) {
+    const ol = el("ol", "trace");
+    ol.setAttribute("aria-label", "Steps that ran");
+    const nodes = data.trace.slice();
+    // Interrupts are not reported as a node, so add the pause as the final step.
+    if (data.status === "pending_approval") nodes.push("approval");
+    nodes.forEach((name, i) => {
+      const li = el("li", "", name);
+      const last = i === nodes.length - 1;
+      if (data.status === "blocked" && last) li.className = "stop";
+      if (data.status === "pending_approval" && last) { li.className = "wait"; li.textContent = "approval (waiting)"; }
+      ol.append(li);
+    });
+    return ol;
+  }
+
+  function enforcedLine(data) {
+    if (!data.enabled_guardrails.length) return null;
+    const names = data.enabled_guardrails.map((id) => {
+      const g = guardrails.find((x) => x.id === id);
+      return g && g.locked ? g.label + " (always on)" : labelOf(id);
+    });
+    return el("p", "enforced", "Checked by: " + names.join(", "));
+  }
+
+  function renderResult(data) {
+    const card = el("article", "card " + data.status);
+    const head = el("div", "card-head");
+    head.append(el("span", "badge", STATUS_LABEL[data.status] || data.status), traceStrip(data));
+    card.append(head);
+
+    if (data.status === "pending_approval" && data.pending) {
+      card.append(el("p", "reply", "The agent wants to create this Jira bug. Nothing is created until you approve."));
+      const dl = el("dl", "ticket");
+      dl.append(el("dt", "", "Summary"), el("dd", "", data.pending.summary),
+                el("dt", "", "Description"), el("dd", "", data.pending.description));
+      card.append(dl);
+      const actions = el("div", "actions");
+      const approve = el("button", "btn primary", "Approve and create");
+      const reject = el("button", "btn", "Reject");
+      approve.type = reject.type = "button";
+      const decide = async (decision) => {
+        approve.disabled = reject.disabled = true;
+        try {
+          const next = await postJSON("/approve", { thread_id: data.thread_id, decision });
+          card.replaceWith(renderResult(next));
+        } catch (err) {
+          approve.disabled = reject.disabled = false;   // let the person retry
+          card.append(el("p", "enforced", err.message));
+        }
+        scrollDown();
+      };
+      approve.addEventListener("click", () => decide("approve"));
+      reject.addEventListener("click", () => decide("reject"));
+      actions.append(approve, reject);
+      card.append(actions);
+    } else {
+      const p = el("p", "reply");
+      p.append(linkify(data.reply || "No reply."));
+      card.append(p);
+    }
+    const line = enforcedLine(data);
+    if (line) card.append(line);
+    return card;
+  }
+
+  function renderError(message) {
+    const card = el("article", "card error");
+    const head = el("div", "card-head");
+    head.append(el("span", "badge", "Request failed"));
+    card.append(head, el("p", "reply", message));
+    return card;
+  }
+
+  // ---------- sending ----------
+  function setBusy(on) { busy = on; sendBtn.disabled = on; }
+
+  async function send() {
+    const text = input.value.trim();
+    if (!text || busy) return;
+    setBusy(true);
+    $("#empty")?.remove();
+
+    // Snapshot the selection for this message so the bubble shows what was applied.
+    const sentWith = [...selected];
+    const u = el("div", "user");
+    u.append(el("div", "bubble", text));
+    u.append(el("div", "sent-with", sentWith.length ? "Extra guardrails: " + sentWith.map(labelOf).join(", ") : "Always-on guardrails only"));
+    thread.append(u);
+
+    input.value = ""; autoGrow();
+    const wait = el("div", "card thinking");
+    wait.append(el("span", "spinner"), el("span", "", "Checking guardrails and running the agent\u2026"));
+    thread.append(wait);
+    scrollDown();
+
+    try {
+      const data = await postJSON("/run", { message: text, enabled_guardrails: sentWith });
+      wait.replaceWith(renderResult(data));
+    } catch (err) {
+      wait.replaceWith(renderError(err.message));
+    } finally {
+      setBusy(false);
+      scrollDown();
+      input.focus();
+    }
+  }
+  sendBtn.addEventListener("click", send);
+
+  document.querySelectorAll("[data-example]").forEach((b) =>
+    b.addEventListener("click", () => { input.value = EXAMPLES[b.dataset.example]; autoGrow(); input.focus(); })
+  );
+
+  // ---------- startup ----------
+  (async function init() {
+    try {
+      guardrails = await api("/guardrails");
+      loadSelection();
+      renderChips();
+    } catch (err) {
+      const b = $("#banner");
+      b.hidden = false;
+      b.textContent = "Can't load guardrails from the API: " + err.message + " Check that uvicorn is running, then reload.";
+    }
+  })();
+</script>
+</body>
+</html>

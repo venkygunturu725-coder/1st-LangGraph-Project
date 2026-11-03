@@ -1,0 +1,30 @@
+# NeMo is the ONLY place request checks live. Each flow below runs as an INPUT rail:
+# it calls an action, then either refuses + `stop`s or just records a verdict in a
+# context variable that agent.py reads back (GenerationOptions.output_vars).
+#
+# The refusal texts must match `refusal` in guardrails_registry.py: agent.py uses that
+# match as a second "was it blocked?" signal next to NeMo's own `stop`.
+
+define bot refuse prompt injection
+  "Security violation: Prompt injection attempt detected. Request blocked."
+
+define bot refuse off topic
+  "I am restricted to SRE operational tasks: creating Jira bug tickets and reading Slack notifications. I cannot assist with general queries."
+
+define flow check prompt injection
+  $is_injection = execute check_prompt_injection(text=$user_message)
+  if $is_injection
+    bot refuse prompt injection
+    stop
+
+# Internal routing step (always on). Decides which tools the user's own words justify.
+# It never refuses; it only sets $tools, which agent.py uses to pick the next node.
+define flow route request
+  $tools = execute authorize_tools(text=$user_message)
+
+# Optional rail. Must run AFTER `route request` because it reads $tools.
+define flow check sre scope
+  $in_scope = execute check_sre_scope(text=$user_message, tools=$tools)
+  if not $in_scope
+    bot refuse off topic
+    stop
