@@ -1,0 +1,25 @@
+apiVersion: afk/v1
+kind: Agent
+metadata:
+  id: slack-jira-agent
+  name: slack-jira-agent
+  version: 1.0.0
+  owner: ''
+  description: ''
+workflow:
+  type: react
+model:
+  alias: default
+  data_class: confidential
+prompts:
+  system: ./prompts/system.md
+tools:
+- id: notify.send
+- id: jira.search_issues
+- id: jira.create_issue
+knowledge: []
+access:
+  execute:
+  - role:user
+guardrails:
+  policy: ./policy.md
